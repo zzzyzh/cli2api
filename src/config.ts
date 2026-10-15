@@ -291,6 +291,7 @@ export interface Settings {
   readonly cursor_agent_extra_args: readonly string[];
   readonly claude_bin: string;
   readonly claude_model: string | null;
+  readonly claude_model_efforts: Readonly<Record<string, string>>;
   readonly claude_use_oauth_api: boolean;
   readonly claude_oauth_creds_path: string;
   readonly claude_oauth_base_url: string;
@@ -416,6 +417,7 @@ function _createSettings(): Settings {
     ),
     claude_bin: process.env.CLAUDE_BIN ?? "claude",
     claude_model: envStr("CLAUDE_MODEL", "").trim() || null,
+    claude_model_efforts: Object.freeze({ ...envJsonDictStrStr("CLAUDE_MODEL_EFFORTS") }),
     claude_use_oauth_api: envBool("CLAUDE_USE_OAUTH_API", false),
     claude_oauth_creds_path: _expandUser(claudeOauthPath),
     claude_oauth_base_url: envStr("CLAUDE_OAUTH_BASE_URL", "https://console.anthropic.com").trim(),

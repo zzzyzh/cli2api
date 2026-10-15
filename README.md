@@ -30,10 +30,12 @@
 - **OpenAI 兼容** — `POST /v1/chat/completions`、`POST /v1/responses`
 - **Anthropic 兼容** — `POST /v1/messages`（流式和非流式）
 - **多 Provider** — Cursor Agent、Codex、Claude Code、Gemini CLI
-- **SSE 流式** — token 级流式输出，含 keepalive 心跳
+- **SSE 流式** — Claude Code 文本与可用的思考增量、心跳、缓存 token 用量统计；避免重复输出
+- **本地 OpenCode 接入** — OpenCode 连接远程网关；项目模式下由远程 Claude Code 执行模型请求和工具操作
+- **模型映射** — 公共模型 ID 可映射到 Claude 模型与独立的 `--effort` 强度
 - **客户端断连取消** — 客户端断开时自动终止子进程，不浪费资源
 - **优雅关闭** — SIGTERM/SIGINT 时 clean shutdown，不留僵尸进程
-- **Tool Call** — Cursor Agent 通过提示工程实现标准 function calling
+- **Tool Call** — Cursor Agent 与 Claude CLI 通过提示工程实现标准 function calling
 - **OAuth 直连** — Claude OAuth API、Gemini Cloud Code API
 - **并发控制** — 可配置最大并发数
 - **认证** — 可选 Bearer Token 鉴权
@@ -100,24 +102,18 @@ npm test
 ```
 
 服务启动后可通过 `Ctrl+C` 优雅关闭 — 停止接受新请求后等待活跃请求完成，然后清理连接池退出。
-```
 
-## 流式 vs 非流式
+## 流式与非流式
 
-**推荐默认使用非流式（`stream: false`）**，尤其是代理 Claude Code 时：
-
-- **非流式**：代码路径最短，子进程 → 收集输出 → 返回 JSON，稳定性最高
-- **流式**：中间多了一层 pump + queue，复杂度更高。适合聊天 UI 需要逐字显示的场景
-
-Claude Code CLI 本身启动较慢，非流式多等几秒对总耗时影响很小，不建议为这点时间差承担流式路径的额外风险。
+两种模式均支持。OpenCode 等聊天界面可使用 `stream: true` 接收 Claude Code 的文本增量，以及 CLI 实际返回的思考增量。网关在内部工具事件期间发送 SSE 心跳，避免长时间没有可见文本时客户端超时；完整消息快照不会重复输出。只需要一次性 JSON 响应时使用 `stream: false`。
 
 ```bash
-# 推荐：非流式
+# 非流式
 curl -X POST http://127.0.0.1:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"claude:sonnet","messages":[{"role":"user","content":"你好"}],"stream":false}'
 
-# 按需：流式
+# 流式
 curl -N http://127.0.0.1:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"claude:sonnet","messages":[{"role":"user","content":"你好"}],"stream":true}'
@@ -135,6 +131,22 @@ curl -N http://127.0.0.1:8000/v1/chat/completions \
 | `GET` | `/debug/config` | 查看当前配置 |
 
 ## 客户端对接
+
+### OpenCode：本地界面与远程 Claude Code
+
+在运行 Claude Code CLI 且已完成登录的主机上启动网关。本地 OpenCode 配置自定义 OpenAI 兼容 Provider，Base URL 指向 `http://<gateway-host>:8000/v1`，API Key 填写 `CODEX_GATEWAY_TOKEN`。本地 OpenCode 负责会话界面，模型请求在网关主机执行。启用下述项目模式后，远程 Claude Code 可以使用原生工具读取它有权访问的项目；若项目只能通过另一台机器的 SSH 访问，需要自行配置项目访问桥接，SSH 凭证可保留在本地。
+
+以下是网关侧的通用模型映射示例，地址和密钥由部署环境设置：
+
+```bash
+CODEX_PROVIDER=auto
+CODEX_MODEL_ALIASES='{"remote-sonnet-high":"claude:sonnet"}'
+CODEX_ADVERTISED_MODELS=remote-sonnet-high
+CLAUDE_MODEL_EFFORTS='{"remote-sonnet-high":"high"}'
+CODEX_GATEWAY_TOKEN=your-secret-token
+```
+
+在 OpenCode 中添加模型 ID `remote-sonnet-high`。为远程 Claude Code 的原生工具配置项目访问后，可选设 `CODEX_CLAUDE_PROJECT_BRIDGE=1`：网关会跳过 OpenCode 自身的通用 Agent 提示和工具定义，将对话交给远程 Claude Code，并在本地回答标题生成请求。工具权限仍由远程 Claude Code 与所配置的项目桥接管理。
 
 ### Cherry Studio / NextChat / ChatBox
 

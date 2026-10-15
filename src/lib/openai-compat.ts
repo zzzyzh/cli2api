@@ -508,10 +508,33 @@ export interface ParsedToolCall {
  * Returns { text, toolCalls } where toolCalls is null if no calls found.
  */
 export function parseToolCallResponse(
-  text: string
+  text: string,
+  options: { allowInvokeXml?: boolean } = {},
 ): { text: string; toolCalls: ParsedToolCall[] | null } {
   const blocks = extractToolCallBlocks(text);
   if (blocks.length === 0) {
+    if (options.allowInvokeXml) {
+      // Claude sometimes uses its native tool syntax despite the marker prompt.
+      // Execute only the first call: later calls require the first tool result.
+      const invoke = /<invoke\s+name="([^"]+)"\s*>([\s\S]*?)<\/invoke>/.exec(text);
+      if (invoke) {
+        const args: Record<string, string> = {};
+        const parameters = /<parameter\s+name="([^"]+)"\s*>([\s\S]*?)<\/parameter>/g;
+        for (const match of invoke[2].matchAll(parameters)) {
+          args[match[1]] = match[2];
+        }
+        if (Object.keys(args).length > 0) {
+          return {
+            text: text.slice(0, invoke.index).trim(),
+            toolCalls: [{
+              id: `call_${randomCallId()}`,
+              type: "function",
+              function: { name: invoke[1], arguments: JSON.stringify(args) },
+            }],
+          };
+        }
+      }
+    }
     return { text, toolCalls: null };
   }
 

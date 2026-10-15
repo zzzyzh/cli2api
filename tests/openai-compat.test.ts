@@ -4,9 +4,21 @@ import assert from "node:assert/strict";
 import {
   compatChatRequestToChatRequest,
   normalizeToolingRequest,
+  parseToolCallResponse,
   responsesRequestToChatRequest,
   type ChatCompletionRequest,
 } from "../src/lib/openai-compat.js";
+
+test("Claude invoke XML becomes one tool call before later speculative calls", () => {
+  const parsed = parseToolCallResponse(
+    'Checking files.\n<invoke name="shell">\n<parameter name="command">./remote.sh pwd</parameter>\n</invoke>\n<invoke name="shell"><parameter name="command">echo later</parameter></invoke>',
+    { allowInvokeXml: true },
+  );
+  assert.equal(parsed.text, "Checking files.");
+  assert.equal(parsed.toolCalls?.length, 1);
+  assert.equal(parsed.toolCalls?.[0].function.name, "shell");
+  assert.deepEqual(JSON.parse(parsed.toolCalls![0].function.arguments), { command: "./remote.sh pwd" });
+});
 
 test("normalizeToolingRequest mirrors top-level tool fields into model_extra", () => {
   const request = normalizeToolingRequest({

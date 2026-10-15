@@ -35,6 +35,7 @@ import {
   formatToolResultMessages,
   parseToolCallResponse,
 } from "./lib/openai-compat.js";
+import { projectClaudeInput } from "./lib/project-claude-proxy.js";
 import { ResponsesRequestSchema } from "./lib/openai-compat.js";
 import { ChatCompletionRequestCompatSchema } from "./lib/openai-compat.js";
 import {
@@ -76,6 +77,7 @@ import {
   iterStreamJsonEvents,
   extractCursorAgentDelta,
   extractClaudeDelta,
+  extractClaudeThinkingDelta,
   extractGeminiDelta,
   extractUsageFromClaudeResult,
   extractUsageFromGeminiResult,
@@ -218,6 +220,25 @@ function openaiError(message: string, statusCode = 500): Response {
       },
     }),
     { status: statusCode, headers: { "Content-Type": "application/json" } }
+  );
+}
+
+function localTitleCompletion(title: string, model: string, stream: boolean): Response | Record<string, unknown> {
+  const id = `chatcmpl-${randomUUID().replace(/-/g, "")}`;
+  const created = Math.floor(Date.now() / 1000);
+  if (!stream) {
+    return {
+      id, object: "chat.completion", created, model,
+      choices: [{ index: 0, message: { role: "assistant", content: title }, finish_reason: "stop" }],
+      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    };
+  }
+  const chunk = (delta: Record<string, string>, finish_reason: string | null) =>
+    `data: ${JSON.stringify({ id, object: "chat.completion.chunk", created, model,
+      choices: [{ index: 0, delta, finish_reason }] })}\n\n`;
+  return new Response(
+    chunk({ role: "assistant", content: title }, null) + chunk({}, "stop") + "data: [DONE]\n\n",
+    { headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" } },
   );
 }
 
@@ -449,7 +470,7 @@ app.get("/v1/models", async (c) => {
   } else {
     models = [defaultId];
   }
-  if (Object.keys(settings.model_aliases).length > 0) {
+  if (settings.advertised_models.length === 0 && Object.keys(settings.model_aliases).length > 0) {
     models.push(...Object.keys(settings.model_aliases), ...Object.values(settings.model_aliases));
   }
   const seen = new Set<string>();
@@ -476,7 +497,7 @@ app.get("/models", async (c) => {
   } else {
     models = [defaultId];
   }
-  if (Object.keys(settings.model_aliases).length > 0) {
+  if (settings.advertised_models.length === 0 && Object.keys(settings.model_aliases).length > 0) {
     models.push(...Object.keys(settings.model_aliases), ...Object.values(settings.model_aliases));
   }
   const seen = new Set<string>();
@@ -846,6 +867,7 @@ async function handleChatCompletions(
     provider = forcedProvider;
     effectiveProviderModel = settings.allow_client_model_override ? providerModel : null;
   }
+  const claudeEffort = settings.claude_model_efforts[requestedModel];
 
   const allowedEfforts = new Set(["low", "medium", "high", "xhigh"]);
   const normalizeEffort = (raw: string | null | undefined): string | null => {
@@ -860,8 +882,19 @@ async function handleChatCompletions(
   const defaultEffort = normalizeEffort((settings.model_reasoning_effort ?? "").trim() || null);
   const reasoningEffort = forcedEffort ?? requestEffort ?? defaultEffort ?? "high";
 
+  const projectInput = process.env.CODEX_CLAUDE_PROJECT_BRIDGE === "1" && provider === "claude"
+    ? projectClaudeInput(req.messages)
+    : null;
+  if (projectInput?.kind === "title") {
+    return localTitleCompletion(projectInput.title, requestedModel, req.stream);
+  }
+
   const rawBody = (req as Record<string, unknown>);
-  const requestTools = rawBody.tools as unknown[] | undefined;
+  // Claude Code already supplies the agent and project tools. OpenCode's tool
+  // declarations are presentation-layer overhead for this dedicated gateway.
+  const requestTools = projectInput?.kind === "prompt"
+    ? undefined
+    : rawBody.tools as unknown[] | undefined;
   const toolSystemPrompt = buildToolCallSystemPrompt(requestTools);
 
   let messagesForPrompt = req.messages;
@@ -869,7 +902,9 @@ async function handleChatCompletions(
     messagesForPrompt = formatToolResultMessages(req.messages);
   }
 
-  let prompt = maybeInjectAutomationGuard(messagesToPrompt(messagesForPrompt));
+  let prompt = projectInput?.kind === "prompt"
+    ? projectInput.prompt
+    : maybeInjectAutomationGuard(messagesToPrompt(messagesForPrompt));
   if (toolSystemPrompt) {
     prompt = `SYSTEM: ${toolSystemPrompt}\n\n${prompt}`;
   }
@@ -878,6 +913,15 @@ async function handleChatCompletions(
   }
 
   const codexSessionId = _c ? extractCodexSessionId(req as Record<string, unknown>, _c.req.raw.headers) : null;
+  const remoteClaudeSession = projectInput?.kind === "prompt"
+    ? _c?.req.raw.headers.get("x-remote-claude-session") ?? ""
+    : "";
+  const remoteClaudeEnv = /^ses_[A-Za-z0-9]+$/.test(remoteClaudeSession)
+    ? {
+        REMOTE_CLAUDE_OPENCODE_SESSION: remoteClaudeSession,
+        REMOTE_CLAUDE_APPROVAL_TURN: `turn_${randomUUID().replace(/-/g, "")}`,
+      }
+    : undefined;
   const codexResponseHeaders: Record<string, string> = {};
   let toolCalls: Record<string, unknown>[] | null = null;
 
@@ -1087,18 +1131,23 @@ async function handleChatCompletions(
               "-p",
               "--output-format",
               "stream-json",
+              ...(process.env.CODEX_CLAUDE_PROJECT_BRIDGE === "1" ? [] : ["--tools", ""]),
+              "--no-session-persistence",
+              ...(process.env.CODEX_CLAUDE_PROJECT_BRIDGE === "1" ? [] : ["--disable-slash-commands"]),
               "--add-dir",
               settings.workspace,
               ...settings.add_dirs.flatMap((d) => ["--add-dir", d]),
             ];
             if (claudeModel) cmd.push("--model", claudeModel);
-            cmd.push("--", prompt);
+            if (claudeEffort) cmd.push("--effort", claudeEffort);
 
             const assembler = new TextAssembler();
             let fallbackText: string | null = null;
             for await (const evt of iterStreamJsonEvents({
               cmd,
+              env: remoteClaudeEnv,
               timeoutMs: settings.timeout_seconds * 1000,
+              stdinData: prompt,
             })) {
               extractClaudeDelta(evt, assembler);
               const u = extractUsageFromClaudeResult(evt);
@@ -1106,6 +1155,11 @@ async function handleChatCompletions(
               if (evt.type === "result" && typeof evt.result === "string") fallbackText = evt.result;
             }
             text = assembler.text || fallbackText || "";
+            if (requestTools && requestTools.length > 0) {
+              const parsed = parseToolCallResponse(text, { allowInvokeXml: true });
+              text = parsed.text;
+              if (parsed.toolCalls) toolCalls = parsed.toolCalls as unknown as Record<string, unknown>[];
+            }
           }
         } else if (provider === "gemini") {
           const geminiModel = effectiveProviderModel ?? settings.gemini_model ?? "gemini-3-flash-preview";
@@ -1184,9 +1238,18 @@ async function handleChatCompletions(
     const stream = new ReadableStream({
       async start(controller) {
         let controllerClosed = false;
+        let lastSseSentAt = Date.now();
         const safeEnqueue = (data: Uint8Array) => {
           if (!controllerClosed) {
-            try { controller.enqueue(data); } catch { controllerClosed = true; }
+            try {
+              controller.enqueue(data);
+              lastSseSentAt = Date.now();
+            } catch { controllerClosed = true; }
+          }
+        };
+        const sendKeepaliveIfDue = () => {
+          if (keepaliveSec > 0 && Date.now() - lastSseSentAt >= keepaliveSec * 1000) {
+            safeEnqueue(encoder.encode(": ping\n\n"));
           }
         };
         const safeClose = () => {
@@ -1316,13 +1379,17 @@ async function handleChatCompletions(
                     "-p",
                     "--output-format",
                     "stream-json",
+                    "--include-partial-messages",
+                    ...(process.env.CODEX_CLAUDE_PROJECT_BRIDGE === "1" ? [] : ["--tools", ""]),
+                    "--no-session-persistence",
+                    ...(process.env.CODEX_CLAUDE_PROJECT_BRIDGE === "1" ? [] : ["--disable-slash-commands"]),
                     "--add-dir",
                     settings.workspace,
                     ...settings.add_dirs.flatMap((d) => ["--add-dir", d]),
                   ];
                   if (claudeModel) cmd.push("--model", claudeModel);
-                  cmd.push("--", prompt);
-                  events = iterStreamJsonEvents({ cmd, timeoutMs: settings.timeout_seconds * 1000, signal: clientSignal });
+                  if (claudeEffort) cmd.push("--effort", claudeEffort);
+                  events = iterStreamJsonEvents({ cmd, env: remoteClaudeEnv, timeoutMs: settings.timeout_seconds * 1000, stdinData: prompt, signal: clientSignal });
                 }
               } else if (provider === "gemini") {
                 const geminiModel = effectiveProviderModel ?? settings.gemini_model ?? "gemini-3-flash-preview";
@@ -1345,13 +1412,13 @@ async function handleChatCompletions(
               }
 
               const assembler = new TextAssembler();
+              const thinkingAssembler = new TextAssembler();
               let shouldRetry = false;
 
               const STREAM_END = Symbol("stream_end");
               type QueueItem = Record<string, unknown> | typeof STREAM_END;
               const queue: QueueItem[] = [];
               let resolveNext: (() => void) | null = null;
-              const waitForNext = () => new Promise<void>((r) => { resolveNext = r; });
 
               const pump = async () => {
                 try {
@@ -1369,30 +1436,24 @@ async function handleChatCompletions(
               };
               void pump();
 
-              let lastEventTime = Date.now();
               while (true) {
-                let evt: Record<string, unknown> | typeof STREAM_END | null = null;
-                if (queue.length > 0) {
-                  evt = queue.shift() ?? null;
-                } else {
-                  const timeoutMs = keepaliveSec > 0 ? keepaliveSec * 1000 : 0;
-                  if (timeoutMs > 0) {
-                    const result = await Promise.race([
-                      waitForNext().then(() => queue.shift() ?? null),
-                      new Promise<null>((r) => setTimeout(() => r(null), timeoutMs)),
-                    ]);
-                    if (result === STREAM_END) break;
-                    if (result === null && queue.length === 0) {
-                      safeEnqueue(encoder.encode(": ping\n\n"));
-                      lastEventTime = Date.now();
-                      continue;
-                    }
-                    evt = result ?? queue.shift() ?? null;
-                  } else {
-                    await waitForNext();
-                    evt = queue.shift() ?? null;
+                if (queue.length === 0) {
+                  await new Promise<void>((resolve) => {
+                    const timer = keepaliveSec > 0
+                      ? setTimeout(resolve, keepaliveSec * 1000)
+                      : null;
+                    resolveNext = () => {
+                      if (timer) clearTimeout(timer);
+                      resolve();
+                    };
+                  });
+                  resolveNext = null;
+                  if (queue.length === 0) {
+                    sendKeepaliveIfDue();
+                    continue;
                   }
                 }
+                const evt = queue.shift() ?? null;
                 if (evt === STREAM_END) break;
 
                 if (evt === null || (evt as Record<string, unknown>)._gateway_error !== undefined) {
@@ -1418,7 +1479,6 @@ async function handleChatCompletions(
                   break;
                 }
 
-                lastEventTime = Date.now();
                 let delta = "";
 
                 if (provider === "codex") {
@@ -1460,7 +1520,20 @@ async function handleChatCompletions(
                 } else if (provider === "cursor-agent") {
                   delta = maybeStripAnswerTags(extractCursorAgentDelta(evt, assembler));
                 } else if (provider === "claude") {
+                  const thinkingDelta = extractClaudeThinkingDelta(evt, thinkingAssembler);
+                  if (thinkingDelta) {
+                    const thinkingChunk = {
+                      id: respId,
+                      object: "chat.completion.chunk",
+                      created,
+                      model: requestedModelForResponse,
+                      choices: [{ index: 0, delta: { reasoning_content: thinkingDelta }, finish_reason: null }],
+                    };
+                    safeEnqueue(encoder.encode(`data: ${JSON.stringify(thinkingChunk)}\n\n`));
+                  }
                   delta = maybeStripAnswerTags(extractClaudeDelta(evt, assembler));
+                  const u = extractUsageFromClaudeResult(evt);
+                  if (u) streamUsage = u;
                   if (evt.type === "result" && Array.isArray(evt.tool_calls) && evt.tool_calls.length > 0) {
                     streamToolCalls = evt.tool_calls as Record<string, unknown>[];
                   }
@@ -1469,28 +1542,45 @@ async function handleChatCompletions(
                 }
 
                 if (delta) {
-                  sentContent = true;
-                  assembledText += delta;
-                  const chunk = {
-                    id: respId,
-                    object: "chat.completion.chunk",
-                    created,
-                    model: requestedModelForResponse,
-                    choices: [{ index: 0, delta: { content: delta }, finish_reason: null }],
-                  };
-                  safeEnqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+                  if (provider === "claude" && requestTools && requestTools.length > 0) {
+                    assembledText += delta;
+                  } else {
+                    sentContent = true;
+                    assembledText += delta;
+                    const chunk = {
+                      id: respId,
+                      object: "chat.completion.chunk",
+                      created,
+                      model: requestedModelForResponse,
+                      choices: [{ index: 0, delta: { content: delta }, finish_reason: null }],
+                    };
+                    safeEnqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+                  }
                 }
+                // Internal CLI events and buffered tool-call text are not sent
+                // to the client. Keep the HTTP stream alive while they arrive.
+                sendKeepaliveIfDue();
               }
 
               if (shouldRetry) continue;
               break;
             }
 
-            // cursor-agent tool call: check accumulated text for tool call markers at stream end
-            if (provider === "cursor-agent" && requestTools && requestTools.length > 0 && assembledText) {
-              const parsed = parseToolCallResponse(assembledText);
+            // CLI providers encode client tool calls in text markers.
+            if ((provider === "cursor-agent" || provider === "claude") && requestTools && requestTools.length > 0 && assembledText) {
+              const parsed = parseToolCallResponse(assembledText, { allowInvokeXml: provider === "claude" });
               if (parsed.toolCalls && parsed.toolCalls.length > 0) {
                 streamToolCalls = parsed.toolCalls as unknown as Record<string, unknown>[];
+              }
+              if (provider === "claude" && parsed.text) {
+                const chunk = {
+                  id: respId,
+                  object: "chat.completion.chunk",
+                  created,
+                  model: requestedModelForResponse,
+                  choices: [{ index: 0, delta: { content: parsed.text }, finish_reason: null }],
+                };
+                safeEnqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
               }
             }
 
@@ -1507,6 +1597,7 @@ async function handleChatCompletions(
                   finish_reason: streamToolCalls?.length ? "tool_calls" : "stop",
                 },
               ],
+              ...(streamUsage ? { usage: streamUsage } : {}),
             };
             if (streamToolCalls?.length) {
               const toolChunk = {
@@ -1514,7 +1605,11 @@ async function handleChatCompletions(
                 object: "chat.completion.chunk",
                 created,
                 model: requestedModelForResponse,
-                choices: [{ index: 0, delta: { tool_calls: streamToolCalls }, finish_reason: null }],
+                choices: [{
+                  index: 0,
+                  delta: { tool_calls: streamToolCalls.map((call, index) => ({ ...call, index })) },
+                  finish_reason: null,
+                }],
               };
               safeEnqueue(encoder.encode(`data: ${JSON.stringify(toolChunk)}\n\n`));
             }

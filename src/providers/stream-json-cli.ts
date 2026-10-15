@@ -34,6 +34,30 @@ function normalizeMessageContent(content: unknown): string {
  */
 export class TextAssembler {
   text = '';
+  private messageText = '';
+
+  append(delta: string): string {
+    if (delta) {
+      this.text += delta;
+      this.messageText += delta;
+    }
+    return delta;
+  }
+
+  resetMessage(): void {
+    this.messageText = '';
+  }
+
+  /** Reconcile Claude's final snapshot for one assistant message with its partial deltas. */
+  finishMessage(incoming: string): string {
+    const snapshot = incoming ?? '';
+    const delta = snapshot.startsWith(this.messageText)
+      ? snapshot.slice(this.messageText.length)
+      : snapshot;
+    this.text += delta;
+    this.messageText = '';
+    return delta;
+  }
 
   feed(incoming: string): string {
     const s = incoming ?? '';
@@ -173,32 +197,45 @@ export async function* iterStreamJsonEvents(
 
     const iface = rl; // non-null: assigned above, only reached inside try block
 
-    const nextLine = (): Promise<string | null> =>
-      new Promise((resolve, reject) => {
+    // Keep listening while the consumer processes an event. Claude can emit
+    // several partial-message lines in one stdout chunk; attaching a new
+    // once('line') listener after each yield would silently drop the rest.
+    const lines: string[] = [];
+    let stdoutClosed = false;
+    let pendingLine: ((line: string | null) => void) | null = null;
+    iface.on('line', (line) => {
+      if (pendingLine) {
+        const resolve = pendingLine;
+        pendingLine = null;
+        resolve(line);
+      } else {
+        lines.push(line);
+      }
+    });
+    iface.on('close', () => {
+      stdoutClosed = true;
+      if (pendingLine) {
+        const resolve = pendingLine;
+        pendingLine = null;
+        resolve(null);
+      }
+    });
+
+    const nextLine = (): Promise<string | null> => {
+      if (lines.length > 0) return Promise.resolve(lines.shift()!);
+      if (stdoutClosed) return Promise.resolve(null);
+      return new Promise((resolve, reject) => {
         const timer = setTimeout(() => {
-          iface.removeListener('line', onLine);
-          iface.removeListener('close', onClose);
+          pendingLine = null;
           proc.kill("SIGKILL");
           reject(new Error(`subprocess timeout after ${timeoutMs}ms`));
         }, timeoutMs);
-
-        const onLine = (line: string) => {
+        pendingLine = (line) => {
           clearTimeout(timer);
-          iface.removeListener('line', onLine);
-          iface.removeListener('close', onClose);
           resolve(line);
         };
-
-        const onClose = () => {
-          clearTimeout(timer);
-          iface.removeListener('line', onLine);
-          iface.removeListener('close', onClose);
-          resolve(null);
-        };
-
-        iface.once('line', onLine);
-        iface.once('close', onClose);
       });
+    };
 
     while (true) {
       if (totalTimedOut) {
@@ -293,12 +330,45 @@ export function extractClaudeDelta(
   evt: Record<string, unknown>,
   assembler: TextAssembler
 ): string {
+  if (evt.type === 'stream_event') {
+    const event = evt.event as Record<string, unknown> | undefined;
+    if (event?.type === 'message_start') assembler.resetMessage();
+    const delta = event?.delta as Record<string, unknown> | undefined;
+    if (event?.type === 'content_block_delta' && delta?.type === 'text_delta' && typeof delta.text === 'string') {
+      return assembler.append(delta.text);
+    }
+  }
   if (evt.type !== 'assistant') return '';
   const message = evt.message;
   if (!message || typeof message !== 'object') return '';
   const content = (message as Record<string, unknown>).content;
   const incoming = normalizeMessageContent(content);
-  return assembler.feed(incoming);
+  return assembler.finishMessage(incoming);
+}
+
+/** Extract only thinking that Claude exposes in its stream. */
+export function extractClaudeThinkingDelta(
+  evt: Record<string, unknown>,
+  assembler: TextAssembler
+): string {
+  if (evt.type === 'stream_event') {
+    const event = evt.event as Record<string, unknown> | undefined;
+    if (event?.type === 'message_start') assembler.resetMessage();
+    const delta = event?.delta as Record<string, unknown> | undefined;
+    if (event?.type === 'content_block_delta' && delta?.type === 'thinking_delta' && typeof delta.thinking === 'string') {
+      return assembler.append(delta.thinking);
+    }
+  }
+  if (evt.type !== 'assistant') return '';
+  const message = evt.message as Record<string, unknown> | undefined;
+  const content = message?.content;
+  if (!Array.isArray(content)) return '';
+  const thinking = content
+    .filter((block): block is Record<string, unknown> => typeof block === 'object' && block !== null)
+    .filter((block) => block.type === 'thinking' && typeof block.thinking === 'string')
+    .map((block) => block.thinking as string)
+    .join('');
+  return assembler.finishMessage(thinking);
 }
 
 /**
@@ -325,7 +395,10 @@ export function extractUsageFromClaudeResult(
   const usage = evt.usage;
   if (!usage || typeof usage !== 'object') return null;
   const u = usage as Record<string, unknown>;
-  const inTokens = Math.floor(Number(u.input_tokens) || 0);
+  const inTokens =
+    Math.floor(Number(u.input_tokens) || 0) +
+    Math.floor(Number(u.cache_creation_input_tokens) || 0) +
+    Math.floor(Number(u.cache_read_input_tokens) || 0);
   const outTokens = Math.floor(Number(u.output_tokens) || 0);
   return {
     prompt_tokens: inTokens,
