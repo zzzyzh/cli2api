@@ -275,6 +275,7 @@ export interface Settings {
   readonly disable_shell_tool: boolean;
   readonly disable_view_image_tool: boolean;
   readonly use_codex_responses_api: boolean;
+  readonly codex_force_cli: boolean;
   readonly codex_responses_base_url: string;
   readonly codex_responses_version: string;
   readonly codex_responses_user_agent: string;
@@ -286,6 +287,7 @@ export interface Settings {
   readonly cursor_agent_workspace: string | null;
   readonly cursor_agent_api_key: string | null;
   readonly cursor_agent_model: string | null;
+  readonly cursor_agent_use_config_model: boolean;
   readonly cursor_agent_stream_partial_output: boolean;
   readonly cursor_agent_disable_indexing: boolean;
   readonly cursor_agent_extra_args: readonly string[];
@@ -396,6 +398,7 @@ function _createSettings(): Settings {
     disable_shell_tool: envBool("CODEX_DISABLE_SHELL_TOOL", true),
     disable_view_image_tool: envBool("CODEX_DISABLE_VIEW_IMAGE_TOOL", true),
     use_codex_responses_api: envBool("CODEX_USE_CODEX_RESPONSES_API", false),
+    codex_force_cli: envBool("CODEX_FORCE_CLI", false),
     codex_responses_base_url: envStr("CODEX_CODEX_BASE_URL", "https://chatgpt.com/backend-api/codex"),
     codex_responses_version: envStr("CODEX_CODEX_VERSION", "0.21.0"),
     codex_responses_user_agent: envStr(
@@ -410,6 +413,7 @@ function _createSettings(): Settings {
     cursor_agent_workspace: envStr("CURSOR_AGENT_WORKSPACE", "").trim() || null,
     cursor_agent_api_key: process.env.CURSOR_AGENT_API_KEY ?? process.env.CURSOR_API_KEY ?? null,
     cursor_agent_model: envStr("CURSOR_AGENT_MODEL", "").trim() || null,
+    cursor_agent_use_config_model: envBool("CURSOR_AGENT_USE_CONFIG_MODEL", false),
     cursor_agent_stream_partial_output: envBool("CURSOR_AGENT_STREAM_PARTIAL_OUTPUT", true),
     cursor_agent_disable_indexing: envBool("CURSOR_AGENT_DISABLE_INDEXING", true),
     cursor_agent_extra_args: Object.freeze(

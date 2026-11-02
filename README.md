@@ -119,6 +119,46 @@ curl -N http://127.0.0.1:8000/v1/chat/completions \
   -d '{"model":"claude:sonnet","messages":[{"role":"user","content":"你好"}],"stream":true}'
 ```
 
+## 一键导出本机 Codex / Cursor
+
+在对应 CLI 已登录的机器上运行：
+
+```bash
+./export.sh          # 同时启动两个后台 API，首次自动安装项目依赖
+./export.sh codex    # GPT-6.1 Sol，xhigh，默认端口 18081
+./export.sh cursor   # Grok 4.7，High，500K，默认端口 18082
+
+# 指定来源与模型参数；Cursor 使用参数化基础模型 ID
+./export.sh codex --model gpt-6.1-sol --effort xhigh --port 18081
+./export.sh cursor --model grok-4.7 --effort high --context 500k --port 18082
+
+./export.sh --stop   # 停止两个后台服务；也可指定 codex/cursor --stop
+```
+
+默认监听 `127.0.0.1`，可通过 `--host` 修改。每个新服务会发送一次真实模型请求验证可用性，成功后分别写入 `.config/codex.json`、`.config/cursor.json`。重复执行相同配置会复用服务。`--no-verify` 可跳过模型请求，生成记录的 `verified_at` 为 `null`。日志保存在 `.config/codex.log`、`.config/cursor.log`。
+
+连接记录包含 `base_url`、`api_key`、`model`、`reasoning_effort`、进程 PID 等信息，可直接供客户端读取：
+
+```python
+import json
+from pathlib import Path
+from openai import OpenAI
+
+config = json.loads(Path(".config/cursor.json").read_text())
+client = OpenAI(base_url=config["base_url"], api_key=config["api_key"])
+response = client.chat.completions.create(
+    model=config["model"],
+    messages=[{"role": "user", "content": "你好"}],
+)
+print(response.choices[0].message.content)
+```
+
+两个导出的服务固定使用所选模型，支持 `/v1/chat/completions` 的普通和 SSE 响应，以及现有的 Anthropic 转换接口。`/v1/responses` 目前仅支持非流式。Codex 设置 `CODEX_FORCE_CLI=1`，流式请求也通过本机 `codex exec --json` 执行，保留 `xhigh`，不降为旧 HTTP 后端的 `high`。CLI 按 [OpenAI 官方非交互模式文档](https://learn.chatgpt.com/docs/non-interactive-mode) 复用本机登录。
+
+Cursor 使用 `.config/cursor-cli/cli-config.json` 单独保存上下文和推理参数，不修改日常 CLI 的模型偏好；普通 `grok-4.7-high` 别名会选择 256K，因此导出时通过参数化配置选择 500K，省略 `--model`。基础模型和参数需由当前账号支持。500K 是模型上下文 token 大小；导出服务的 prompt 字符数上限默认提高到 4,000,000，可通过 `CODEX_MAX_PROMPT_CHARS` 调整。Codex CLI 的 SSE 文本在 `agent_message` 完成时发送。
+
+`.config/` 已加入 `.gitignore`；连接文件权限为 `600`。该目录只保存网关连接密钥和独立的模型配置，CLI 登录凭据仍由原 CLI 管理。
+
 ## API 端点
 
 | 方法 | 路径 | 描述 |

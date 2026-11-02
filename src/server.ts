@@ -520,6 +520,7 @@ app.get("/debug/config", async (c) => {
     allow_client_model_override: settings.allow_client_model_override,
     default_model: settings.default_model,
     cursor_agent_model: settings.cursor_agent_model ?? "auto",
+    cursor_agent_use_config_model: settings.cursor_agent_use_config_model,
     cursor_agent_workspace: settings.cursor_agent_workspace,
     cursor_agent_disable_indexing: settings.cursor_agent_disable_indexing,
     cursor_agent_extra_args: settings.cursor_agent_extra_args,
@@ -538,6 +539,7 @@ app.get("/debug/config", async (c) => {
     model_reasoning_effort: settings.model_reasoning_effort,
     force_reasoning_effort: settings.force_reasoning_effort,
     use_codex_responses_api: settings.use_codex_responses_api,
+    codex_force_cli: settings.codex_force_cli,
     codex_cli_home: settings.codex_cli_home,
     workspace: settings.workspace,
     max_concurrency: settings.max_concurrency,
@@ -934,6 +936,7 @@ async function handleChatCompletions(
   const useGeminiCloudcode = provider === "gemini" && settings.gemini_use_cloudcode_api;
   const useCodexBackend =
     provider === "codex" &&
+    !settings.codex_force_cli &&
     (settings.use_codex_responses_api ||
       (settings.enable_image_input && imageUrls.length > 0) ||
       req.stream);
@@ -1090,7 +1093,7 @@ async function handleChatCompletions(
           if (settings.cursor_agent_disable_indexing) cmd.push("--disable-indexing");
           cmd.push(...settings.cursor_agent_extra_args);
           if (settings.cursor_agent_api_key) cmd.push("--api-key", settings.cursor_agent_api_key);
-          if (cursorModel) cmd.push("--model", cursorModel);
+          if (cursorModel && !settings.cursor_agent_use_config_model) cmd.push("--model", cursorModel);
           if (settings.cursor_agent_stream_partial_output) cmd.push("--stream-partial-output");
           const { cmd: finalCmd, stdinData } = buildCursorAgentCmd(cmd, prompt);
 
@@ -1342,6 +1345,7 @@ async function handleChatCompletions(
                     codexCliHome: settings.codex_cli_home,
                     timeoutSeconds: settings.timeout_seconds,
                     streamLimit: settings.subprocess_stream_limit,
+                    signal: clientSignal,
                   });
                 }
               } else if (provider === "cursor-agent") {
@@ -1362,7 +1366,7 @@ async function handleChatCompletions(
                 if (settings.cursor_agent_disable_indexing) cmd.push("--disable-indexing");
                 cmd.push(...settings.cursor_agent_extra_args);
                 if (settings.cursor_agent_api_key) cmd.push("--api-key", settings.cursor_agent_api_key);
-                if (cursorModel) cmd.push("--model", cursorModel);
+                if (cursorModel && !settings.cursor_agent_use_config_model) cmd.push("--model", cursorModel);
                 if (settings.cursor_agent_stream_partial_output) cmd.push("--stream-partial-output");
                 const { cmd: cursorFinalCmd, stdinData: cursorStdinData } = buildCursorAgentCmd(cmd, prompt);
                 events = iterStreamJsonEvents({ cmd: cursorFinalCmd, timeoutMs: settings.timeout_seconds * 1000, totalTimeoutMs: settings.timeout_seconds * 1000, killOnResult: true, stdinData: cursorStdinData, signal: clientSignal });
@@ -1515,6 +1519,12 @@ async function handleChatCompletions(
                       if (item.type === "agent_message") {
                         delta = maybeStripAnswerTags(String(item.text ?? ""));
                       }
+                    }
+                    if (evt.type === "turn.completed") {
+                      const u = (evt.usage as Record<string, unknown>) ?? {};
+                      const pt = Number(u.input_tokens ?? 0);
+                      const ct = Number(u.output_tokens ?? 0);
+                      streamUsage = { prompt_tokens: pt, completion_tokens: ct, total_tokens: pt + ct };
                     }
                   }
                 } else if (provider === "cursor-agent") {

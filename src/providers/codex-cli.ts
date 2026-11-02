@@ -6,9 +6,9 @@ import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import { homedir } from "node:os";
 import * as path from "node:path";
-import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import type { ApprovalPolicy, SandboxMode } from "../config.js";
+import { iterStreamJsonEvents } from "./stream-json-cli.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -54,6 +54,7 @@ export interface IterCodexEventsOpts extends RunCodexFinalOpts {
   captureEvents?: boolean;
   eventCallback?: (evt: Record<string, unknown>) => void;
   stderrCallback?: (line: string) => void;
+  signal?: AbortSignal;
 }
 
 function _buildEnv(codexCliHome: string | null): NodeJS.ProcessEnv {
@@ -123,7 +124,7 @@ export function buildCodexExecCmd(opts: BuildCodexExecCmdOpts): string[] {
     modelReasoningEffort,
   } = opts;
 
-  const cmd: string[] = ["codex", "-a", approvalPolicy];
+  const cmd: string[] = [process.env.CODEX_BIN ?? "codex", "-a", approvalPolicy];
   if (disableShellTool) cmd.push("--disable", "shell_tool");
   if (disableViewImageTool) cmd.push("--disable", "view_image_tool");
   if (enableSearch) cmd.push("--search");
@@ -219,134 +220,34 @@ class RuntimeError extends Error {
 export async function* iterCodexEvents(
   opts: IterCodexEventsOpts
 ): AsyncGenerator<Record<string, unknown>> {
-  const {
-    codexCliHome,
-    timeoutSeconds,
-    streamLimit = 8 * 1024 * 1024,
-    captureEvents = false,
-    eventCallback,
-    stderrCallback,
-  } = opts;
-
   ensureCodexHome({
-    codexCliHome,
+    codexCliHome: opts.codexCliHome,
     trustedDir: opts.cd,
     defaultModel: opts.model,
     modelReasoningEffort: opts.modelReasoningEffort,
   });
 
-  const cmd = buildCodexExecCmd({ ...opts, jsonEvents: true });
-  const env = _buildEnv(codexCliHome);
-
-  const proc = spawn(cmd[0], cmd.slice(1), {
-    env: { ...env },
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-
-  const stderrBuf: Buffer[] = [];
+  // stdin avoids the OS argument-size limit for long API conversations.
+  const cmd = buildCodexExecCmd({ ...opts, prompt: "-", jsonEvents: true });
   let lastError: string | null = null;
-
-  if (proc.stderr) {
-    proc.stderr.on("data", (chunk: Buffer) => {
-      stderrBuf.push(chunk);
-      if (stderrBuf.length > 1 && Buffer.concat(stderrBuf).length > 64_000) {
-        stderrBuf.shift();
-      }
-      if (stderrCallback) {
-        const text = chunk.toString("utf-8");
-        const lines = text.split("\n");
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (trimmed) stderrCallback(trimmed);
-        }
-      }
-    });
-  }
-
-  if (!proc.stdout) {
-    proc.kill("SIGKILL");
-    throw new Error("codex exec stdout not available");
-  }
-
-  const rl = createInterface({ input: proc.stdout });
-  const lineIterator = rl[Symbol.asyncIterator]();
-
-  const readWithTimeout = (): Promise<IteratorResult<string, void>> => {
-    let timeoutId: ReturnType<typeof setTimeout>;
-    const timeoutPromise = new Promise<IteratorResult<string, void>>((_, rej) => {
-      timeoutId = setTimeout(() => {
-        proc.kill("SIGKILL");
-        rej(new Error("codex exec timed out"));
-      }, timeoutSeconds * 1000);
-    });
-    return Promise.race([
-      lineIterator.next().then((r) => {
-        clearTimeout(timeoutId);
-        return r;
-      }),
-      timeoutPromise,
-    ]);
-  };
-
-  try {
-    while (true) {
-      let result: IteratorResult<string, void>;
-      try {
-        result = await readWithTimeout();
-      } catch (e) {
-        throw e;
-      }
-
-      if (result.done) break;
-
-      const line = (result.value as string)?.trim();
-      if (!line) continue;
-
-      let evt: Record<string, unknown>;
-      try {
-        evt = JSON.parse(line) as Record<string, unknown>;
-      } catch {
-        continue;
-      }
-
-      const evtType = evt.type;
-      if (evtType === "error" || evtType === "turn.failed") {
-        const msg = evt.message;
-        if (typeof msg === "string" && msg.trim()) lastError = msg.trim();
-        const errObj = evt.error;
-        if (
-          errObj &&
-          typeof errObj === "object" &&
-          typeof (errObj as Record<string, unknown>).message === "string"
-        ) {
-          lastError = ((errObj as Record<string, unknown>).message as string).trim() || lastError;
-        }
-      }
-
-      if (eventCallback) eventCallback(evt);
-
-      if (captureEvents) {
-        yield { _event: evt };
-      } else {
-        yield evt;
-      }
+  for await (const evt of iterStreamJsonEvents({
+    cmd,
+    env: opts.codexCliHome ? { CODEX_HOME: path.join(opts.codexCliHome, ".codex") } : undefined,
+    stdinData: opts.prompt,
+    timeoutMs: opts.timeoutSeconds * 1000,
+    totalTimeoutMs: opts.timeoutSeconds * 1000,
+    signal: opts.signal,
+    eventCallback: opts.eventCallback,
+    stderrCallback: opts.stderrCallback,
+  })) {
+    if (evt.type === "error" || evt.type === "turn.failed") {
+      const err = evt.error as Record<string, unknown> | undefined;
+      lastError = String(err?.message ?? evt.message ?? "codex exec failed");
+      if (evt.type === "turn.failed") throw new Error(lastError);
     }
-
-    await new Promise<void>((resolve) => proc.on("close", () => resolve()));
-
-    if (proc.exitCode !== 0) {
-      const msg =
-        Buffer.concat(stderrBuf).toString("utf-8").trim() ||
-        lastError ||
-        `codex exec failed: ${proc.exitCode}`;
-      throw new Error(msg);
-    }
-  } finally {
-    if (proc.exitCode === null) {
-      proc.kill("SIGKILL");
-    }
-    rl.close();
+    yield opts.captureEvents ? { _event: evt } : evt;
   }
+  if (lastError) throw new Error(lastError);
 }
 
 export async function collectCodexTextAndUsageFromEvents(
